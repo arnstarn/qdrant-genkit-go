@@ -173,6 +173,180 @@ func TestIntegration_IndexAndRetrieve(t *testing.T) {
 	}
 }
 
+// TestIntegration_NamedVectors exercises the multi-slot path: one collection
+// with two named vector slots, each populated by its own embedder via its own
+// Config. Verifies that:
+//   - The plugin registers separate indexer/retriever pairs at "<col>/<slot>".
+//   - Indexing into one slot does not populate the other slot's vector.
+//   - Retrieval is scoped to the queried slot.
+//   - Filtering still works on a per-slot retrieve.
+func TestIntegration_NamedVectors(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in -short mode")
+	}
+	if !dockerAvailable() {
+		t.Skip("skipping integration test: Docker not available")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	container, err := tcqdrant.Run(ctx, "qdrant/qdrant:v1.12.4")
+	if err != nil {
+		t.Skipf("qdrant container failed to start: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := testcontainers.TerminateContainer(container); err != nil {
+			t.Logf("terminate qdrant: %v", err)
+		}
+	})
+
+	host, port := grpcEndpoint(ctx, t, container)
+
+	rawClient, err := qclient.NewClient(&qclient.Config{Host: host, Port: port})
+	if err != nil {
+		t.Fatalf("qdrant client: %v", err)
+	}
+	defer rawClient.Close()
+
+	const collection = "multi_modal"
+	const (
+		textSlot  = "text"
+		imageSlot = "image"
+		textDim   = 4
+		imageDim  = 8
+	)
+
+	// Create a collection with two named vector slots of different dimensions.
+	if err := rawClient.CreateCollection(ctx, &qclient.CreateCollection{
+		CollectionName: collection,
+		VectorsConfig: qclient.NewVectorsConfigMap(map[string]*qclient.VectorParams{
+			textSlot:  {Size: textDim, Distance: qclient.Distance_Cosine},
+			imageSlot: {Size: imageDim, Distance: qclient.Distance_Cosine},
+		}),
+	}); err != nil {
+		t.Fatalf("create collection: %v", err)
+	}
+
+	textEmbedder := &fakeEmbedder{dims: textDim}
+	imageEmbedder := &fakeEmbedder{dims: imageDim}
+
+	g := genkit.Init(ctx,
+		genkit.WithPlugins(&Qdrant{
+			Configs: []Config{
+				{
+					CollectionName: collection,
+					ClientParams:   ClientParams{Host: host, Port: port},
+					Embedder:       textEmbedder,
+					VectorName:     textSlot,
+				},
+				{
+					CollectionName: collection,
+					ClientParams:   ClientParams{Host: host, Port: port},
+					Embedder:       imageEmbedder,
+					VectorName:     imageSlot,
+				},
+			},
+		}),
+	)
+
+	textIndexer := Indexer(g, collection+"/"+textSlot)
+	imageIndexer := Indexer(g, collection+"/"+imageSlot)
+	textRetr := Retriever(g, collection+"/"+textSlot)
+	imageRetr := Retriever(g, collection+"/"+imageSlot)
+
+	if textIndexer == nil || imageIndexer == nil {
+		t.Fatal("named-vector indexers not registered at <col>/<slot>")
+	}
+	if textRetr == nil || imageRetr == nil {
+		t.Fatal("named-vector retrievers not registered at <col>/<slot>")
+	}
+
+	// Verify single-slot retriever lookup at the bare collection name does NOT
+	// resolve when the only configs are named-vector.
+	if Retriever(g, collection) != nil {
+		t.Errorf("Retriever(%q) should be nil when only named-vector configs registered", collection)
+	}
+
+	// Index different content into each slot.
+	textDocs := []*ai.Document{
+		ai.DocumentFromText("alpha-text", map[string]any{"slot": "text"}),
+		ai.DocumentFromText("beta-text", map[string]any{"slot": "text"}),
+	}
+	if err := textIndexer.Index(ctx, textDocs); err != nil {
+		t.Fatalf("text index: %v", err)
+	}
+	imageDocs := []*ai.Document{
+		ai.DocumentFromText("gamma-image", map[string]any{"slot": "image"}),
+		ai.DocumentFromText("delta-image", map[string]any{"slot": "image"}),
+	}
+	if err := imageIndexer.Index(ctx, imageDocs); err != nil {
+		t.Fatalf("image index: %v", err)
+	}
+
+	// Retrieve from text slot; should see only text-side hits because the
+	// image slot has no vector for these point IDs.
+	textResp, err := textRetr.Retrieve(ctx, &ai.RetrieverRequest{
+		Query:   ai.DocumentFromText("alpha-text", nil),
+		Options: &RetrieverOptions{K: 5},
+	})
+	if err != nil {
+		t.Fatalf("text retrieve: %v", err)
+	}
+	if len(textResp.Documents) == 0 {
+		t.Fatal("text slot returned no documents")
+	}
+	for _, d := range textResp.Documents {
+		text := ""
+		if len(d.Content) > 0 {
+			text = d.Content[0].Text
+		}
+		if !strings.Contains(text, "-text") {
+			t.Errorf("text slot returned non-text doc: %q", text)
+		}
+	}
+
+	// Retrieve from image slot; symmetric expectation.
+	imageResp, err := imageRetr.Retrieve(ctx, &ai.RetrieverRequest{
+		Query:   ai.DocumentFromText("gamma-image", nil),
+		Options: &RetrieverOptions{K: 5},
+	})
+	if err != nil {
+		t.Fatalf("image retrieve: %v", err)
+	}
+	if len(imageResp.Documents) == 0 {
+		t.Fatal("image slot returned no documents")
+	}
+	for _, d := range imageResp.Documents {
+		text := ""
+		if len(d.Content) > 0 {
+			text = d.Content[0].Text
+		}
+		if !strings.Contains(text, "-image") {
+			t.Errorf("image slot returned non-image doc: %q", text)
+		}
+	}
+
+	// Filter on text slot. Should still only see text-side hits.
+	textFiltered, err := textRetr.Retrieve(ctx, &ai.RetrieverRequest{
+		Query: ai.DocumentFromText("alpha-text", nil),
+		Options: &RetrieverOptions{
+			K: 5,
+			Filter: map[string]any{
+				"must": []map[string]any{
+					{"key": "metadata.slot", "match": map[string]any{"value": "text"}},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("text retrieve (filtered): %v", err)
+	}
+	if len(textFiltered.Documents) != len(textDocs) {
+		t.Errorf("text filtered: got %d docs, want %d", len(textFiltered.Documents), len(textDocs))
+	}
+}
+
 // dockerAvailable performs a lightweight probe for the Docker socket. If the
 // probe fails we skip the integration test rather than burn time waiting for
 // testcontainers to time out.
