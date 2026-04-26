@@ -1,8 +1,11 @@
 package client
 
 import (
+	"errors"
 	"strings"
 	"testing"
+
+	qclient "github.com/qdrant/go-client/qdrant"
 )
 
 // TestNew_AppliesDefaults verifies that a zero-value Params struct produces a
@@ -138,5 +141,29 @@ func TestNew_DistinctClients(t *testing.T) {
 
 	if c1 == c2 {
 		t.Errorf("expected distinct client instances on each New() call")
+	}
+}
+
+// TestNew_ConstructorErrorIsWrapped covers the error-wrap branch in New: when
+// the underlying constructor fails, New must wrap with the host:port context
+// and propagate the original via errors.Is.
+func TestNew_ConstructorErrorIsWrapped(t *testing.T) {
+	wantErr := errors.New("simulated connect failure")
+
+	prev := newClient
+	newClient = func(*qclient.Config) (*qclient.Client, error) {
+		return nil, wantErr
+	}
+	t.Cleanup(func() { newClient = prev })
+
+	_, err := New(Params{Host: "boom.example.test", Port: 6334})
+	if err == nil {
+		t.Fatal("expected error from New when underlying constructor fails")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("errors.Is wantErr: %v", err)
+	}
+	if !strings.Contains(err.Error(), "boom.example.test:6334") {
+		t.Errorf("error %q should mention host:port", err)
 	}
 }

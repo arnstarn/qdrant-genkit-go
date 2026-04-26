@@ -19,6 +19,11 @@ type Params struct {
 	UseTLS bool
 }
 
+// newClient is the underlying constructor used by New. It is a package-level
+// variable so tests can substitute a stub that simulates a connection failure;
+// production code always uses qclient.NewClient.
+var newClient = qclient.NewClient
+
 // New returns a connected Qdrant client. The official Go client uses gRPC; the
 // default port is 6334 (not the REST port 6333). Callers may pass either.
 func New(p Params) (*qclient.Client, error) {
@@ -31,7 +36,7 @@ func New(p Params) (*qclient.Client, error) {
 		port = 6334
 	}
 
-	c, err := qclient.NewClient(&qclient.Config{
+	c, err := newClient(&qclient.Config{
 		Host:   host,
 		Port:   port,
 		APIKey: p.APIKey,

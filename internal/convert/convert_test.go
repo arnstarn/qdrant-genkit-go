@@ -1,6 +1,7 @@
 package convert
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/firebase/genkit/go/ai"
@@ -429,5 +430,476 @@ func TestFilterFromMap_FloatMatchValueIntegralOK(t *testing.T) {
 	}
 	if got := f.Must[0].GetField().Match.GetInteger(); got != 7 {
 		t.Errorf("integer match = %v, want 7", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DocumentText — nil-Part skip path. The first Part is nil; the second is a
+// real text part that must still be appended.
+// ---------------------------------------------------------------------------
+
+func TestDocumentText_NilPartSkipped(t *testing.T) {
+	doc := &ai.Document{
+		Content: []*ai.Part{
+			nil,
+			ai.NewTextPart("only"),
+		},
+	}
+	if got := DocumentText(doc); got != "only" {
+		t.Errorf("DocumentText = %q, want only", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DocumentID — nil document error path.
+// ---------------------------------------------------------------------------
+
+func TestDocumentID_NilDoc(t *testing.T) {
+	if _, err := DocumentID(nil); err == nil {
+		t.Errorf("expected error for nil document")
+	}
+}
+
+func TestDocumentID_MarshalError(t *testing.T) {
+	// A function value in Metadata makes json.Marshal fail; that should
+	// surface as the wrapped "marshal document" error.
+	doc := &ai.Document{
+		Content:  []*ai.Part{ai.NewTextPart("x")},
+		Metadata: map[string]any{"f": func() {}},
+	}
+	_, err := DocumentID(doc)
+	if err == nil {
+		t.Fatalf("expected marshal error")
+	}
+	if got := err.Error(); !strings.Contains(got, "marshal document") {
+		t.Errorf("err = %q, want it to mention 'marshal document'", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ValueToAny — default branch for an unrecognized one-of kind. We construct a
+// pristine *qclient.Value (no Kind set) so GetKind returns nil and we fall
+// through to the default case.
+// ---------------------------------------------------------------------------
+
+func TestValueToAny_DefaultBranch(t *testing.T) {
+	v := &qclient.Value{} // no Kind set → GetKind() returns nil → default case
+	if got := ValueToAny(v); got != nil {
+		t.Errorf("ValueToAny(empty Value) = %v (%T), want nil", got, got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ScoredPointToDocument — metadata key holds a non-map value (e.g., a
+// string). The function should fall through to the "flat payload" branch.
+// ---------------------------------------------------------------------------
+
+func TestScoredPointToDocument_MetadataNotMap(t *testing.T) {
+	payload := qclient.NewValueMap(map[string]any{
+		"content":  "doc text",
+		"metadata": "not a map", // string under the metadata key
+		"src":      "file.md",
+	})
+	sp := &qclient.ScoredPoint{Payload: payload, Score: 0.1}
+
+	doc := ScoredPointToDocument(sp, "content", "metadata")
+	if doc == nil {
+		t.Fatal("ScoredPointToDocument returned nil")
+	}
+	if got := doc.Content[0].Text; got != "doc text" {
+		t.Errorf("text = %q, want doc text", got)
+	}
+	// "metadata" was a string → fell into the flat-payload branch.
+	if got := doc.Metadata["src"]; got != "file.md" {
+		t.Errorf("metadata.src = %v, want file.md", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// DocumentToPoint — error and fallback branches.
+// ---------------------------------------------------------------------------
+
+func TestDocumentToPoint_NilDoc(t *testing.T) {
+	if _, err := DocumentToPoint(nil, []float32{0.1}, "", "content", "metadata"); err == nil {
+		t.Errorf("expected error for nil document")
+	}
+}
+
+func TestDocumentToPoint_DocumentIDError(t *testing.T) {
+	// Metadata containing a func makes DocumentID's json.Marshal fail; that
+	// error should propagate up through DocumentToPoint.
+	doc := &ai.Document{
+		Content:  []*ai.Part{ai.NewTextPart("x")},
+		Metadata: map[string]any{"f": func() {}},
+	}
+	_, err := DocumentToPoint(doc, []float32{0.1}, "", "content", "metadata")
+	if err == nil {
+		t.Errorf("expected DocumentID error to propagate")
+	}
+}
+
+func TestDocumentToPoint_NoMetadata(t *testing.T) {
+	// A document with nil Metadata exercises the "doc.Metadata != nil" guard.
+	doc := ai.DocumentFromText("only", nil)
+	p, err := DocumentToPoint(doc, []float32{0.1}, "", "content", "metadata")
+	if err != nil {
+		t.Fatalf("DocumentToPoint: %v", err)
+	}
+	if _, ok := p.Payload["metadata"]; ok {
+		t.Errorf("payload.metadata should be absent when doc has no metadata")
+	}
+}
+
+func TestDocumentToPoint_JSONFallbackCoercion(t *testing.T) {
+	// []int is rejected by TryValueMap (only []interface{} is supported),
+	// but JSON-encodes cleanly. The DocumentToPoint fallback should
+	// JSON-round-trip the metadata into a generic map[string]any and put it
+	// onto the point.
+	doc := ai.DocumentFromText("hello", map[string]any{
+		"ids": []int{1, 2, 3},
+	})
+	p, err := DocumentToPoint(doc, []float32{0.1, 0.2}, "", "content", "metadata")
+	if err != nil {
+		t.Fatalf("DocumentToPoint: %v", err)
+	}
+	if got := p.Payload["content"].GetStringValue(); got != "hello" {
+		t.Errorf("content = %q, want hello", got)
+	}
+	// The metadata key landed via the JSON fallback.
+	if _, ok := p.Payload["metadata"]; !ok {
+		t.Errorf("expected metadata to be present after JSON fallback coercion")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// FilterFromMap — error branches in conditionsFromAny / conditionFromMap.
+// ---------------------------------------------------------------------------
+
+func TestFilterFromMap_AnyShape_ConditionNotMap(t *testing.T) {
+	in := map[string]any{
+		"must": []any{"not a map"},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when []any element is not a map")
+	}
+}
+
+func TestFilterFromMap_AnyShape_NestedConditionError(t *testing.T) {
+	in := map[string]any{
+		"must": []any{
+			map[string]any{"key": "x"}, // missing match/range
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected nested condition error")
+	}
+}
+
+func TestFilterFromMap_TypedShape_NestedConditionError(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "x"}, // neither match nor range
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected nested condition error in typed-shape branch")
+	}
+}
+
+func TestFilterFromMap_ConditionsWrongType(t *testing.T) {
+	// A scalar where a slice of conditions was expected.
+	in := map[string]any{"must": "scalar"}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error for non-slice conditions")
+	}
+}
+
+func TestFilterFromMap_MatchNotMap(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "x", "match": "scalar"},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when match is not a map")
+	}
+}
+
+func TestFilterFromMap_MatchMissingKey(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"match": map[string]any{"value": "x"}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when 'key' is missing on a match condition")
+	}
+}
+
+func TestFilterFromMap_RangeNotMap(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "x", "range": "scalar"},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when range is not a map")
+	}
+}
+
+func TestFilterFromMap_RangeMissingKey(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"range": map[string]any{"gt": 1}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when 'key' is missing on a range condition")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// matchCondition value coercion — exercise every supported scalar type plus
+// the no-key/missing-shape error branches.
+// ---------------------------------------------------------------------------
+
+func TestFilterFromMap_MatchBool(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"value": false}},
+		},
+	}
+	f, err := FilterFromMap(in)
+	if err != nil {
+		t.Fatalf("FilterFromMap: %v", err)
+	}
+	if got := f.Must[0].GetField().Match.GetBoolean(); got {
+		t.Errorf("match bool = %v, want false", got)
+	}
+}
+
+func TestFilterFromMap_MatchInt(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"value": int(42)}},
+		},
+	}
+	f, err := FilterFromMap(in)
+	if err != nil {
+		t.Fatalf("FilterFromMap: %v", err)
+	}
+	if got := f.Must[0].GetField().Match.GetInteger(); got != 42 {
+		t.Errorf("match int = %v, want 42", got)
+	}
+}
+
+func TestFilterFromMap_MatchInt32(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"value": int32(11)}},
+		},
+	}
+	f, err := FilterFromMap(in)
+	if err != nil {
+		t.Fatalf("FilterFromMap: %v", err)
+	}
+	if got := f.Must[0].GetField().Match.GetInteger(); got != 11 {
+		t.Errorf("match int32 = %v, want 11", got)
+	}
+}
+
+func TestFilterFromMap_MatchInt64(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"value": int64(99)}},
+		},
+	}
+	f, err := FilterFromMap(in)
+	if err != nil {
+		t.Fatalf("FilterFromMap: %v", err)
+	}
+	if got := f.Must[0].GetField().Match.GetInteger(); got != 99 {
+		t.Errorf("match int64 = %v, want 99", got)
+	}
+}
+
+func TestFilterFromMap_MatchUnsupportedType(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"value": []byte("nope")}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error for unsupported match value type")
+	}
+}
+
+func TestFilterFromMap_MatchMissingValueAndAny(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when match has neither 'value' nor 'any'")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// matchCondition's "any" branch — every numeric variant + error paths.
+// ---------------------------------------------------------------------------
+
+func TestFilterFromMap_MatchAnyNotSlice(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"any": "scalar"}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when match.any is not a slice")
+	}
+}
+
+func TestFilterFromMap_MatchAnyEmpty(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"any": []any{}}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when match.any is empty")
+	}
+}
+
+func TestFilterFromMap_MatchAnyKeywordsMixed(t *testing.T) {
+	// A non-string slipped into a keyword list → error.
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"any": []any{"a", 1}}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when keyword slice mixes types")
+	}
+}
+
+func TestFilterFromMap_MatchAnyIntsMixed(t *testing.T) {
+	// Stage int as the inferred element type via the first entry; then a
+	// non-numeric in the tail → error.
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"any": []any{int(1), "two"}}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error when int slice contains non-numeric")
+	}
+}
+
+func TestFilterFromMap_MatchAnyAllIntKinds(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"any": []any{int(1), int32(2), int64(3), float64(4)}}},
+		},
+	}
+	f, err := FilterFromMap(in)
+	if err != nil {
+		t.Fatalf("FilterFromMap: %v", err)
+	}
+	got := f.Must[0].GetField().Match.GetIntegers()
+	if got == nil || len(got.Integers) != 4 {
+		t.Fatalf("integers = %v, want length 4", got)
+	}
+	want := []int64{1, 2, 3, 4}
+	for i, w := range want {
+		if got.Integers[i] != w {
+			t.Errorf("integers[%d] = %d, want %d", i, got.Integers[i], w)
+		}
+	}
+}
+
+func TestFilterFromMap_MatchAnyUnsupportedElement(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "match": map[string]any{"any": []any{true}}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error for unsupported any-element type")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// rangeCondition — every operator branch + error paths.
+// ---------------------------------------------------------------------------
+
+func TestFilterFromMap_RangeAllOps(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "range": map[string]any{"gt": 1, "gte": 2, "lt": 9, "lte": 10}},
+		},
+	}
+	f, err := FilterFromMap(in)
+	if err != nil {
+		t.Fatalf("FilterFromMap: %v", err)
+	}
+	r := f.Must[0].GetField().Range
+	if r.Gt == nil || *r.Gt != 1 {
+		t.Errorf("Gt = %v, want 1", r.Gt)
+	}
+	if r.Gte == nil || *r.Gte != 2 {
+		t.Errorf("Gte = %v, want 2", r.Gte)
+	}
+	if r.Lt == nil || *r.Lt != 9 {
+		t.Errorf("Lt = %v, want 9", r.Lt)
+	}
+	if r.Lte == nil || *r.Lte != 10 {
+		t.Errorf("Lte = %v, want 10", r.Lte)
+	}
+}
+
+func TestFilterFromMap_RangeBadValueType(t *testing.T) {
+	in := map[string]any{
+		"must": []map[string]any{
+			{"key": "k", "range": map[string]any{"gt": "nope"}},
+		},
+	}
+	if _, err := FilterFromMap(in); err == nil {
+		t.Errorf("expected error for non-numeric range value")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// toFloat64 — all numeric kinds.
+// ---------------------------------------------------------------------------
+
+func TestFilterFromMap_RangeNumericKinds(t *testing.T) {
+	cases := []struct {
+		name string
+		v    any
+		want float64
+	}{
+		{"int", int(1), 1},
+		{"int32", int32(2), 2},
+		{"int64", int64(3), 3},
+		{"float32", float32(4.5), 4.5},
+		{"float64", float64(5.5), 5.5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := map[string]any{
+				"must": []map[string]any{
+					{"key": "k", "range": map[string]any{"gt": tc.v}},
+				},
+			}
+			f, err := FilterFromMap(in)
+			if err != nil {
+				t.Fatalf("FilterFromMap: %v", err)
+			}
+			r := f.Must[0].GetField().Range
+			if r.Gt == nil || *r.Gt != tc.want {
+				t.Errorf("Gt = %v, want %v", r.Gt, tc.want)
+			}
+		})
 	}
 }

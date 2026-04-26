@@ -97,6 +97,10 @@ type RetrieverOptions struct {
 	//     README for examples and supported subset.
 	//   - *qdrant.Filter (from github.com/qdrant/go-client/qdrant): pass
 	//     through unchanged for arbitrary filters (geo, datetime, nested).
+	//
+	// Note: pass *qdrant.Filter (a pointer), not a value. The underlying
+	// generated protobuf type embeds a sync.Mutex via its message machinery,
+	// so passing it by value would trip `go vet copylocks`.
 	Filter any
 
 	// ScoreThreshold, if set, drops results whose similarity score is below
@@ -197,6 +201,11 @@ func applyConfigDefaults(cfg *Config) {
 	}
 }
 
+// newClientFn is the constructor used by clientFor. It exists as a
+// package-level variable so tests can substitute a stub that simulates a
+// connection failure. Production code always uses client.New.
+var newClientFn = client.New
+
 // clientFor returns a Qdrant client for the given connection params, creating
 // it on first use and reusing it across configs that share an endpoint.
 func (q *Qdrant) clientFor(cp ClientParams) (*qclient.Client, error) {
@@ -204,7 +213,7 @@ func (q *Qdrant) clientFor(cp ClientParams) (*qclient.Client, error) {
 	if c, ok := q.clients[key]; ok {
 		return c, nil
 	}
-	c, err := client.New(client.Params{
+	c, err := newClientFn(client.Params{
 		Host:   cp.Host,
 		Port:   cp.Port,
 		APIKey: cp.APIKey,
@@ -270,19 +279,28 @@ func Index(ctx context.Context, g *genkit.Genkit, name string, docs []*ai.Docume
 	return idx.Index(ctx, docs)
 }
 
+// pointsAPI is the subset of *qclient.Client used by retrieverImpl and
+// indexerImpl. Defining it as an interface lets unit tests substitute a fake
+// without spinning up Qdrant; the production code path always passes the
+// concrete *qclient.Client, which satisfies it via embedded methods.
+type pointsAPI interface {
+	Query(ctx context.Context, request *qclient.QueryPoints) ([]*qclient.ScoredPoint, error)
+	Upsert(ctx context.Context, request *qclient.UpsertPoints) (*qclient.UpdateResult, error)
+}
+
 // retrieverImpl bundles the per-config state needed to serve a retrieval
 // request: the Qdrant client, the collection/vector to target, and the
 // embedder to vectorize the query.
 type retrieverImpl struct {
 	name       string
 	cfg        *Config
-	c          *qclient.Client
+	c          pointsAPI
 	contentKey string
 	metaKey    string
 	vectorName string
 }
 
-func newRetriever(name string, cfg *Config, c *qclient.Client) *retrieverImpl {
+func newRetriever(name string, cfg *Config, c pointsAPI) *retrieverImpl {
 	return &retrieverImpl{
 		name:       name,
 		cfg:        cfg,
@@ -373,14 +391,16 @@ func optsFromRequest(req *ai.RetrieverRequest) RetrieverOptions {
 
 // buildFilter accepts either a *qclient.Filter (passed through) or a
 // map[string]any that we translate via the convert package.
+//
+// Note: only the pointer form is accepted for *qclient.Filter; passing a
+// qclient.Filter by value trips `go vet copylocks` because the generated
+// protobuf message machinery embeds a sync.Mutex.
 func buildFilter(filter any) (*qclient.Filter, error) {
 	switch f := filter.(type) {
 	case nil:
 		return nil, nil
 	case *qclient.Filter:
 		return f, nil
-	case qclient.Filter:
-		return &f, nil
 	case map[string]any:
 		return convert.FilterFromMap(f)
 	default:
@@ -392,13 +412,13 @@ func buildFilter(filter any) (*qclient.Filter, error) {
 type indexerImpl struct {
 	name       string
 	cfg        *Config
-	c          *qclient.Client
+	c          pointsAPI
 	contentKey string
 	metaKey    string
 	vectorName string
 }
 
-func newIndexer(name string, cfg *Config, c *qclient.Client) *indexerImpl {
+func newIndexer(name string, cfg *Config, c pointsAPI) *indexerImpl {
 	return &indexerImpl{
 		name:       name,
 		cfg:        cfg,

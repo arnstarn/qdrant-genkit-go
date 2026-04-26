@@ -24,6 +24,8 @@ import (
 	"github.com/firebase/genkit/go/core/api"
 	"github.com/firebase/genkit/go/genkit"
 	qclient "github.com/qdrant/go-client/qdrant"
+
+	"github.com/arnstarn/qdrant-genkit-go/internal/client"
 )
 
 // failingEmbedder is an embedder that always returns the configured error so
@@ -32,8 +34,8 @@ type failingEmbedder struct {
 	err error
 }
 
-func (f *failingEmbedder) Name() string                                   { return "fail" }
-func (f *failingEmbedder) Register(api.Registry)                          {} //nolint:revive
+func (f *failingEmbedder) Name() string          { return "fail" }
+func (f *failingEmbedder) Register(api.Registry) {} //nolint:revive
 func (f *failingEmbedder) Embed(_ context.Context, _ *ai.EmbedRequest) (*ai.EmbedResponse, error) {
 	return nil, f.err
 }
@@ -232,16 +234,14 @@ func TestOptsFromRequest_PassthroughFields(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// buildFilter — value Filter passthrough (the existing test covers the
-// pointer form; this exercises the by-value branch).
+// buildFilter — pointer-only contract.
 // ----------------------------------------------------------------------------
-
-// (No by-value Filter passthrough test: qclient.Filter embeds a sync.Mutex via
-// the protobuf message machinery, so even constructing a fresh value to pass
-// in trips `go vet`'s copylocks check. The pointer-passthrough branch is
-// already exercised in TestBuildFilter_Passthrough; the by-value branch will
-// be covered once we either retire the legacy any-typed Filter input or we
-// drop the unused case in v0.2.)
+//
+// The pointer-passthrough branch is exercised in TestBuildFilter_Passthrough.
+// We deliberately do not accept qclient.Filter by value: the generated
+// protobuf type embeds a sync.Mutex, so a by-value branch would trip `go vet
+// copylocks` for any test attempting to exercise it. Callers should pass
+// *qdrant.Filter; the by-value branch was removed.
 
 // ----------------------------------------------------------------------------
 // Retriever / Indexer / Index lookup wrappers.
@@ -502,4 +502,414 @@ func TestNewIndexer_FieldsCopied(t *testing.T) {
 	if i.name != "c/vec" || i.contentKey != "txt" || i.metaKey != "md" || i.vectorName != "vec" {
 		t.Errorf("indexerImpl fields not copied as expected: %+v", i)
 	}
+}
+
+// ----------------------------------------------------------------------------
+// fakePoints satisfies the pointsAPI interface so unit tests can drive the
+// retrieve and Index code paths past the gRPC call without a live Qdrant.
+// ----------------------------------------------------------------------------
+
+type fakePoints struct {
+	// Captured by Query/Upsert.
+	queryReq  *qclient.QueryPoints
+	upsertReq *qclient.UpsertPoints
+
+	// Outputs.
+	queryHits  []*qclient.ScoredPoint
+	queryErr   error
+	upsertResp *qclient.UpdateResult
+	upsertErr  error
+}
+
+func (f *fakePoints) Query(_ context.Context, req *qclient.QueryPoints) ([]*qclient.ScoredPoint, error) {
+	f.queryReq = req
+	return f.queryHits, f.queryErr
+}
+
+func (f *fakePoints) Upsert(_ context.Context, req *qclient.UpsertPoints) (*qclient.UpdateResult, error) {
+	f.upsertReq = req
+	return f.upsertResp, f.upsertErr
+}
+
+// ----------------------------------------------------------------------------
+// retrieverImpl.retrieve — happy path + post-Query error wrapping. These
+// exercise the post-embedding code paths that previously required a live
+// Qdrant container, including filter application, named-vector slot wiring,
+// score-threshold passthrough, and the hit→Document conversion loop.
+// ----------------------------------------------------------------------------
+
+func TestRetrieve_HappyPath(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	hit := &qclient.ScoredPoint{
+		Payload: qclient.NewValueMap(map[string]any{
+			"content":  "hello",
+			"metadata": map[string]any{"src": "test"},
+		}),
+		Score: 0.42,
+	}
+	fp := &fakePoints{queryHits: []*qclient.ScoredPoint{hit}}
+	r := newRetriever("test_collection", cfg, fp)
+
+	resp, err := r.retrieve(context.Background(), &ai.RetrieverRequest{
+		Query:   ai.DocumentFromText("query", nil),
+		Options: &RetrieverOptions{K: 5},
+	})
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if len(resp.Documents) != 1 {
+		t.Fatalf("got %d docs, want 1", len(resp.Documents))
+	}
+	if got := resp.Documents[0].Content[0].Text; got != "hello" {
+		t.Errorf("doc text = %q, want hello", got)
+	}
+	// Limit was forwarded.
+	if fp.queryReq == nil || fp.queryReq.Limit == nil || *fp.queryReq.Limit != 5 {
+		t.Errorf("Limit = %v, want 5", fp.queryReq.Limit)
+	}
+	// Bare collection: no Using slot set.
+	if fp.queryReq.Using != nil {
+		t.Errorf("Using = %v, want nil for single-vector collection", fp.queryReq.Using)
+	}
+	// CollectionName is propagated.
+	if fp.queryReq.CollectionName != "test_collection" {
+		t.Errorf("CollectionName = %q, want test_collection", fp.queryReq.CollectionName)
+	}
+}
+
+func TestRetrieve_NamedVectorSetsUsing(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+		VectorName:         "text",
+	}
+	fp := &fakePoints{}
+	r := newRetriever("test_collection/text", cfg, fp)
+	if _, err := r.retrieve(context.Background(), &ai.RetrieverRequest{
+		Query: ai.DocumentFromText("q", nil),
+	}); err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if fp.queryReq.Using == nil || *fp.queryReq.Using != "text" {
+		t.Errorf("Using = %v, want 'text'", fp.queryReq.Using)
+	}
+}
+
+func TestRetrieve_ScoreThresholdForwarded(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	fp := &fakePoints{}
+	r := newRetriever("test_collection", cfg, fp)
+	thr := float32(0.6)
+	if _, err := r.retrieve(context.Background(), &ai.RetrieverRequest{
+		Query:   ai.DocumentFromText("q", nil),
+		Options: &RetrieverOptions{ScoreThreshold: &thr},
+	}); err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if fp.queryReq.ScoreThreshold == nil || *fp.queryReq.ScoreThreshold != 0.6 {
+		t.Errorf("ScoreThreshold = %v, want 0.6", fp.queryReq.ScoreThreshold)
+	}
+}
+
+func TestRetrieve_FilterMapForwarded(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	fp := &fakePoints{}
+	r := newRetriever("test_collection", cfg, fp)
+	if _, err := r.retrieve(context.Background(), &ai.RetrieverRequest{
+		Query: ai.DocumentFromText("q", nil),
+		Options: &RetrieverOptions{
+			Filter: map[string]any{
+				"must": []map[string]any{
+					{"key": "src", "match": map[string]any{"value": "test"}},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if fp.queryReq.Filter == nil || len(fp.queryReq.Filter.Must) != 1 {
+		t.Errorf("Filter not forwarded; got %v", fp.queryReq.Filter)
+	}
+}
+
+func TestRetrieve_QueryError(t *testing.T) {
+	wantErr := errors.New("rpc boom")
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	fp := &fakePoints{queryErr: wantErr}
+	r := newRetriever("test_collection", cfg, fp)
+	_, err := r.retrieve(context.Background(), &ai.RetrieverRequest{
+		Query: ai.DocumentFromText("q", nil),
+	})
+	if err == nil || !strings.Contains(err.Error(), "qdrant.retrieve: query") {
+		t.Errorf("err = %v, want wrapping with 'qdrant.retrieve: query'", err)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("errors.Is wantErr: %v", err)
+	}
+}
+
+func TestRetrieve_EmptyHits(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	fp := &fakePoints{queryHits: nil}
+	r := newRetriever("test_collection", cfg, fp)
+	resp, err := r.retrieve(context.Background(), &ai.RetrieverRequest{
+		Query: ai.DocumentFromText("q", nil),
+	})
+	if err != nil {
+		t.Fatalf("retrieve: %v", err)
+	}
+	if len(resp.Documents) != 0 {
+		t.Errorf("got %d docs, want 0", len(resp.Documents))
+	}
+}
+
+// ----------------------------------------------------------------------------
+// indexerImpl.Index — happy path + Upsert error wrapping. These cover the
+// document→point conversion loop, the wait flag, and the post-Upsert error
+// wrap. The pre-call error paths (empty docs, embedder failure, count
+// mismatch) are covered above.
+// ----------------------------------------------------------------------------
+
+func TestIndex_HappyPath(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	fp := &fakePoints{}
+	i := newIndexer("test_collection", cfg, fp)
+
+	docs := []*ai.Document{
+		ai.DocumentFromText("alpha", map[string]any{"i": 1}),
+		ai.DocumentFromText("beta", map[string]any{"i": 2}),
+	}
+	if err := i.Index(context.Background(), docs); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if fp.upsertReq == nil {
+		t.Fatal("Upsert was not invoked")
+	}
+	if fp.upsertReq.CollectionName != "test_collection" {
+		t.Errorf("CollectionName = %q, want test_collection", fp.upsertReq.CollectionName)
+	}
+	if len(fp.upsertReq.Points) != len(docs) {
+		t.Errorf("len(Points) = %d, want %d", len(fp.upsertReq.Points), len(docs))
+	}
+	if fp.upsertReq.Wait == nil || !*fp.upsertReq.Wait {
+		t.Errorf("Wait = %v, want true", fp.upsertReq.Wait)
+	}
+}
+
+func TestIndex_NamedVectorPath(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+		VectorName:         "text",
+	}
+	fp := &fakePoints{}
+	i := newIndexer("test_collection/text", cfg, fp)
+	if err := i.Index(context.Background(), []*ai.Document{
+		ai.DocumentFromText("only", nil),
+	}); err != nil {
+		t.Fatalf("Index: %v", err)
+	}
+	if len(fp.upsertReq.Points) != 1 {
+		t.Fatalf("len(Points) = %d, want 1", len(fp.upsertReq.Points))
+	}
+	// Named vector → Vectors oneof should be the named-map form.
+	v := fp.upsertReq.Points[0].Vectors
+	if _, ok := v.GetVectorsOptions().(*qclient.Vectors_Vectors); !ok {
+		t.Errorf("expected named-vector wrapping, got %T", v.GetVectorsOptions())
+	}
+}
+
+func TestIndex_UpsertError(t *testing.T) {
+	wantErr := errors.New("upsert boom")
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	fp := &fakePoints{upsertErr: wantErr}
+	i := newIndexer("test_collection", cfg, fp)
+	err := i.Index(context.Background(), []*ai.Document{ai.DocumentFromText("x", nil)})
+	if err == nil || !strings.Contains(err.Error(), "qdrant.index: upsert") {
+		t.Errorf("err = %v, want wrapping with 'qdrant.index: upsert'", err)
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("errors.Is wantErr: %v", err)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Index wrapper — happy path: when the registered indexer succeeds, the
+// package-level Index returns nil. Backed by a stub indexer that we install
+// directly into the plugin's internal map.
+// ----------------------------------------------------------------------------
+
+func TestIndex_Wrapper_Success(t *testing.T) {
+	ctx := context.Background()
+	g := genkit.Init(ctx,
+		genkit.WithPlugins(&Qdrant{
+			Configs: []Config{{
+				CollectionName: "test_collection",
+				ClientParams:   ClientParams{Host: "localhost", Port: 6334},
+				Embedder:       stubEmbedder{},
+			}},
+		}),
+	)
+
+	// Replace the indexer's pointsAPI with a fake to avoid the gRPC hop.
+	idx := Indexer(g, "test_collection")
+	if idx == nil {
+		t.Fatal("indexer not registered")
+	}
+	impl, ok := idx.(*indexerImpl)
+	if !ok {
+		t.Fatalf("indexer is %T, want *indexerImpl", idx)
+	}
+	impl.c = &fakePoints{}
+
+	if err := Index(ctx, g, "test_collection", []*ai.Document{
+		ai.DocumentFromText("payload", nil),
+	}); err != nil {
+		t.Errorf("Index wrapper returned %v, want nil", err)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Indexer plugin-cast guard: Indexer() must return nil when the plugin
+// registered under "qdrant" is not actually a *Qdrant. We force this by
+// registering a stub plugin.
+// ----------------------------------------------------------------------------
+
+type bogusPlugin struct{}
+
+func (bogusPlugin) Name() string                        { return provider }
+func (bogusPlugin) Init(_ context.Context) []api.Action { return nil }
+
+func TestIndexer_PluginCastFails_ReturnsNil(t *testing.T) {
+	ctx := context.Background()
+	g := genkit.Init(ctx, genkit.WithPlugins(bogusPlugin{}))
+	if got := Indexer(g, "anything"); got != nil {
+		t.Errorf("Indexer with non-Qdrant plugin = %v, want nil", got)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Index — convert.DocumentToPoint error path. A nil document survives the
+// embedder count check (the stub allocates one slot per input) but trips the
+// "convert: nil document" branch in DocumentToPoint, which we expect to wrap
+// with "build point".
+// ----------------------------------------------------------------------------
+
+func TestIndex_BuildPointError(t *testing.T) {
+	cfg := &Config{
+		CollectionName:     "test_collection",
+		Embedder:           stubEmbedder{},
+		ContentPayloadKey:  "content",
+		MetadataPayloadKey: "metadata",
+	}
+	fp := &fakePoints{}
+	i := newIndexer("test_collection", cfg, fp)
+
+	err := i.Index(context.Background(), []*ai.Document{nil})
+	if err == nil || !strings.Contains(err.Error(), "build point") {
+		t.Errorf("err = %v, want wrapping with 'build point'", err)
+	}
+	// We never reached Upsert.
+	if fp.upsertReq != nil {
+		t.Errorf("Upsert should not be called when point conversion fails")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// clientFor / Init — connection failures. We swap newClientFn to force an
+// error and assert (a) clientFor returns it unchanged, and (b) Init wraps it
+// with the configs[i] prefix and panics.
+// ----------------------------------------------------------------------------
+
+func withFailingNewClient(t *testing.T, err error) {
+	t.Helper()
+	prev := newClientFn
+	newClientFn = func(client.Params) (*qclient.Client, error) {
+		return nil, err
+	}
+	t.Cleanup(func() { newClientFn = prev })
+}
+
+func TestClientFor_NewClientError(t *testing.T) {
+	wantErr := errors.New("connection refused")
+	withFailingNewClient(t, wantErr)
+
+	q := newQdrantWithMaps()
+	_, err := q.clientFor(ClientParams{Host: "x", Port: 1})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Errorf("errors.Is wantErr: %v", err)
+	}
+	if len(q.clients) != 0 {
+		t.Errorf("clients map has %d entries, want 0 on failure", len(q.clients))
+	}
+}
+
+func TestInit_PanicsOnClientForFailure(t *testing.T) {
+	wantErr := errors.New("dial busted")
+	withFailingNewClient(t, wantErr)
+
+	q := &Qdrant{Configs: []Config{{
+		CollectionName: "test_collection",
+		Embedder:       stubEmbedder{},
+	}}}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic")
+		}
+		err, ok := r.(error)
+		if !ok {
+			t.Fatalf("recovered %T, want error", r)
+		}
+		if !strings.Contains(err.Error(), "configs[0]") {
+			t.Errorf("err = %v, want it to mention configs[0]", err)
+		}
+		if !errors.Is(err, wantErr) {
+			t.Errorf("errors.Is wantErr: %v", err)
+		}
+	}()
+	_ = q.Init(context.Background())
 }
