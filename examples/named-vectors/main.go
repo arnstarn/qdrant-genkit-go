@@ -12,6 +12,7 @@ import (
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
+
 	qdrantplugin "github.com/arnstarn/qdrant-genkit-go"
 )
 
@@ -20,34 +21,31 @@ func main() {
 
 	var textEmbedder, imageEmbedder ai.Embedder // wire up via your plugins
 
-	g, err := genkit.Init(ctx,
+	g := genkit.Init(ctx,
 		genkit.WithPlugins(&qdrantplugin.Qdrant{
 			Configs: []qdrantplugin.Config{
 				{
 					CollectionName: "media_library",
-					ClientParams:   qdrantplugin.ClientParams{Host: "localhost", Port: 6333},
+					ClientParams:   qdrantplugin.ClientParams{Host: "localhost", Port: 6334},
 					Embedder:       textEmbedder,
 					VectorName:     "text",
 				},
 				{
 					CollectionName: "media_library",
-					ClientParams:   qdrantplugin.ClientParams{Host: "localhost", Port: 6333},
+					ClientParams:   qdrantplugin.ClientParams{Host: "localhost", Port: 6334},
 					Embedder:       imageEmbedder,
 					VectorName:     "image",
 				},
 			},
 		}),
 	)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	// Retrieve text-similar documents
 	textRetriever := qdrantplugin.Retriever(g, "media_library/text")
-	resp, err := ai.Retrieve(ctx, textRetriever,
-		ai.WithRetrieverOpts(&ai.RetrieverOptions{K: 5}),
-		ai.WithRetrieverText("how does X work"),
-	)
+	resp, err := textRetriever.Retrieve(ctx, &ai.RetrieverRequest{
+		Query:   ai.DocumentFromText("how does X work", nil),
+		Options: &qdrantplugin.RetrieverOptions{K: 5},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
+
 	qdrantplugin "github.com/arnstarn/qdrant-genkit-go"
 )
 
@@ -20,18 +21,15 @@ func main() {
 
 	var embedder ai.Embedder // wire up via your embedding plugin
 
-	g, err := genkit.Init(ctx,
+	g := genkit.Init(ctx,
 		genkit.WithPlugins(&qdrantplugin.Qdrant{
 			Configs: []qdrantplugin.Config{{
 				CollectionName: "docs",
-				ClientParams:   qdrantplugin.ClientParams{Host: "localhost", Port: 6333},
+				ClientParams:   qdrantplugin.ClientParams{Host: "localhost", Port: 6334},
 				Embedder:       embedder,
 			}},
 		}),
 	)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	retriever := qdrantplugin.Retriever(g, "docs")
 
@@ -49,13 +47,13 @@ func main() {
 		},
 	}
 
-	resp, err := ai.Retrieve(ctx, retriever,
-		ai.WithRetrieverOpts(&ai.RetrieverOptions{
+	resp, err := retriever.Retrieve(ctx, &ai.RetrieverRequest{
+		Query: ai.DocumentFromText("how to handle context cancellation", nil),
+		Options: &qdrantplugin.RetrieverOptions{
 			K:      5,
 			Filter: filter,
-		}),
-		ai.WithRetrieverText("how to handle context cancellation"),
-	)
+		},
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
