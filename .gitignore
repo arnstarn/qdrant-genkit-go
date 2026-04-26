@@ -1,0 +1,32 @@
+# Go
+*.exe
+*.test
+*.out
+*.prof
+bin/
+dist/
+vendor/
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing artifacts
+coverage.out
+coverage.html
+
+# Local secrets (should never exist in this repo, but defense in depth)
+.env
+.env.*
+*.token
+*.secret
