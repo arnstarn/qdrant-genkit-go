@@ -48,10 +48,12 @@ resp, _ := retriever.Retrieve(ctx, &ai.RetrieverRequest{
 
 - [Getting started](docs/getting-started.md) — install, run Qdrant, configure an embedder, index and retrieve
 - [Configuration](docs/configuration.md) — every option explained
+- [Connection patterns](docs/connection.md) — gRPC, TLS, Qdrant Cloud, self-hosted
 - [Named vectors](docs/named-vectors.md) — multi-vector collections
 - [Filtering](docs/filtering.md) — Qdrant filter syntax with examples
 - [API reference](docs/api-reference.md) — godoc-style overview
 - [Roadmap](docs/roadmap.md) — what's planned
+- [Changelog](CHANGELOG.md) — release history
 
 See [`docs/README.md`](docs/README.md) for the docs index.
 
